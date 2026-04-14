@@ -40,8 +40,8 @@ Supported provider arguments:
 data "bluelobster_available_instances" "all" {}
 
 resource "bluelobster_instance" "worker" {
-  region        = "us-east-dev"
-  instance_type = "gpu_1x_a4000"
+  region        = "igl"
+  instance_type = "v1_gpu_1x_a5000"
   username      = "ubuntu"
   name          = "ml-worker-1"
 
@@ -66,7 +66,7 @@ This provider does not currently implement imperative or low-value control-plane
 ## Build
 
 ```bash
-go mod tidy
-go test ./...
-go install
+make tidy
+make test
+make install
 ```
