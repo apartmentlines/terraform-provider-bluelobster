@@ -9,3 +9,7 @@ Manages the backup schedule attached to an instance.
 - `hour_utc` required
 - `day_of_week` optional, used by weekly schedules
 - `day_of_month` optional, used by monthly schedules
+
+## Attribute Reference
+
+- `id` Resource ID. This is set to the same value as `instance_id`.
