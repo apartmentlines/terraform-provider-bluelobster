@@ -19,13 +19,13 @@ variable "standard_instance_name" {
 variable "standard_region" {
   description = "Region for the standard instance."
   type        = string
-  default     = "phl"
+  default     = "igl"
 }
 
 variable "standard_instance_type" {
   description = "Instance type for the standard instance."
   type        = string
-  default     = "v1_gpu_1x_2080ti"
+  default     = "v1_gpu_1x_a5000"
 }
 
 variable "standard_username" {

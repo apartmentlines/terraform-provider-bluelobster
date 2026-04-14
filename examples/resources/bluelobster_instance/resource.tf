@@ -1,6 +1,6 @@
 resource "bluelobster_instance" "worker" {
-  region        = "us-east-dev"
-  instance_type = "gpu_1x_a4000"
+  region        = "igl"
+  instance_type = "v1_gpu_1x_a5000"
   username      = "ubuntu"
   name          = "worker-1"
 
