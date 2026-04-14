@@ -1,0 +1,9 @@
+create_standard_instance = true
+
+standard_region        = "phi"
+standard_instance_type = "v1_gpu_1x_2080ti"
+standard_username      = "ubuntu"
+standard_template_name = "UBUNTU-22-04-NV"
+
+backup_frequency = "daily"
+backup_hour_utc  = 3
