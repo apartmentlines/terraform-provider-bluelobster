@@ -5,6 +5,6 @@ resource "bluelobster_instance" "worker" {
   name          = "worker-1"
 
   template_name     = "UBUNTU-22-04-NV"
-  ssh_public_key_wo = file("~/.ssh/id_ed25519.pub")
+  ssh_public_key_wo = file(pathexpand("~/.ssh/id_ed25519.pub"))
   power_state       = "running"
 }

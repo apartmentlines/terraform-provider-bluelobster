@@ -72,7 +72,7 @@ func (p *BlueLobsterProvider) Configure(ctx context.Context, req provider.Config
 	if apiKey == "" {
 		resp.Diagnostics.AddError(
 			"Missing Blue Lobster API key",
-			"Set `api_key` in provider configuration or export `BLUELOBSTER_API_KEY`.",
+			"Set `api_key` in provider configuration or export `BLUELOBSTER_API_KEY` or `BLUELOBSTER_API_TOKEN`.",
 		)
 		return
 	}

@@ -27,6 +27,8 @@ provider "bluelobster" {
 }
 ```
 
+If `api_key` is omitted, the provider falls back to `BLUELOBSTER_API_KEY` and then `BLUELOBSTER_API_TOKEN`.
+
 Supported provider arguments:
 
 - `api_key` (optional, sensitive): Blue Lobster API key. Can also be supplied with `BLUELOBSTER_API_KEY` or `BLUELOBSTER_API_TOKEN`.
@@ -44,7 +46,7 @@ resource "bluelobster_instance" "worker" {
   name          = "ml-worker-1"
 
   template_name     = "UBUNTU-22-04-NV"
-  ssh_public_key_wo = file("~/.ssh/id_ed25519.pub")
+  ssh_public_key_wo = file(pathexpand("~/.ssh/id_ed25519.pub"))
   power_state       = "running"
 }
 ```
@@ -54,7 +56,8 @@ resource "bluelobster_instance" "worker" {
 - `bluelobster_instance` is the standard region + instance type flow.
 - Credentials are write-only on create and are not stored in Terraform state.
 - `power_state` is declarative and only supports `running` and `stopped`.
-- Image selection and credentials are create-time fields and force replacement.
+- `region`, `instance_type`, image selection, metadata, and credentials are create-time fields and force replacement.
+- Set at least one of `ssh_public_key_wo` or `password_wo`, and one of `template_name` or `iso_url`.
 
 ## Intentionally skipped
 
