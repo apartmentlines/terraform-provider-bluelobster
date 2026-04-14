@@ -9,11 +9,11 @@ BIN_NAME="terraform-provider-bluelobster"
 
 TARGETS=(
   "linux/amd64"
-  "linux/arm64"
-  "darwin/amd64"
-  "darwin/arm64"
-  "windows/amd64"
-  "windows/arm64"
+  # "linux/arm64"
+  # "darwin/amd64"
+  # "darwin/arm64"
+  # "windows/amd64"
+  # "windows/arm64"
 )
 
 mkdir -p "${DIST_DIR}"

@@ -4,7 +4,7 @@ This repository contains a Terraform provider for managing Blue Lobster infrastr
 
 ## Supported objects
 
-- Resources: `bluelobster_instance`, `bluelobster_custom_instance`, `bluelobster_instance_firewall`, `bluelobster_backup_schedule`, `bluelobster_instance_ip`
+- Resources: `bluelobster_instance`, `bluelobster_instance_firewall`, `bluelobster_backup_schedule`, `bluelobster_instance_ip`
 - Data sources: `bluelobster_available_instances`, `bluelobster_templates`, `bluelobster_instances`, `bluelobster_instance`, `bluelobster_instance_backups`
 
 Main docs: [Provider docs](docs/index.md)
@@ -52,10 +52,9 @@ resource "bluelobster_instance" "worker" {
 ## Resource model
 
 - `bluelobster_instance` is the standard region + instance type flow.
-- `bluelobster_custom_instance` is the host-pinned custom sizing flow and requires `gpu_model_input`.
 - Credentials are write-only on create and are not stored in Terraform state.
 - `power_state` is declarative and only supports `running` and `stopped`.
-- Custom sizing inputs, image selection, and credentials are create-time fields and force replacement.
+- Image selection and credentials are create-time fields and force replacement.
 
 ## Intentionally skipped
 

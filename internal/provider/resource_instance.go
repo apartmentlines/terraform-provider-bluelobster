@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -14,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 )
 
 var (
@@ -188,13 +190,7 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 
-	instanceID, err := r.resolveCreatedInstanceID(ctx, launch)
-	if err != nil {
-		resp.Diagnostics.AddError("Unable to resolve created Blue Lobster instance", err.Error())
-		return
-	}
-
-	remote, err := r.client.WaitForInstanceVisible(ctx, instanceID)
+	remote, err := r.waitForCreatedInstance(ctx, launch)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to observe created Blue Lobster instance", err.Error())
 		return
@@ -217,11 +213,43 @@ func (r *InstanceResource) resolveCreatedInstanceID(ctx context.Context, launch 
 	if launch.InstanceID != "" {
 		return launch.InstanceID, nil
 	}
+	if launch.TaskID == "" {
+		return "", fmt.Errorf("launch response did not include an instance identifier or task id")
+	}
 	task, err := r.client.WaitForTask(ctx, launch.TaskID)
 	if err != nil {
 		return "", err
 	}
 	return extractInstanceIDFromTask(task)
+}
+
+func (r *InstanceResource) waitForCreatedInstance(ctx context.Context, launch LaunchResponse) (VMInstance, error) {
+	instanceID := launch.InstanceID
+	if launch.TaskID != "" {
+		tflog.Debug(ctx, "waiting for Blue Lobster launch task", map[string]any{
+			"task_id":     launch.TaskID,
+			"instance_id": instanceID,
+			"assigned_ip": launch.AssignedIP,
+		})
+		task, err := r.client.WaitForTask(ctx, launch.TaskID)
+		if err != nil {
+			return VMInstance{}, err
+		}
+		if instanceID == "" {
+			instanceID, err = extractInstanceIDFromTask(task)
+			if err != nil {
+				return VMInstance{}, err
+			}
+		}
+	}
+	if instanceID == "" {
+		return VMInstance{}, fmt.Errorf("unable to resolve created Blue Lobster instance id")
+	}
+
+	tflog.Debug(ctx, "waiting for Blue Lobster instance to become visible", map[string]any{
+		"instance_id": instanceID,
+	})
+	return r.client.WaitForInstanceVisible(ctx, instanceID)
 }
 
 func extractInstanceIDFromTask(task Task) (string, error) {
@@ -267,23 +295,39 @@ func (r *InstanceResource) Update(ctx context.Context, req resource.UpdateReques
 	}
 
 	if strings.TrimSpace(plan.Name.ValueString()) != strings.TrimSpace(state.Name.ValueString()) && strings.TrimSpace(plan.Name.ValueString()) != "" {
-		if err := r.client.RenameInstance(ctx, state.ID.ValueString(), strings.TrimSpace(plan.Name.ValueString())); err != nil {
+		remote, err := applyInstanceAction(ctx, r.client, state.ID.ValueString(), "rename",
+			func(ctx context.Context) (ActionResponse, error) {
+				return r.client.RenameInstance(ctx, state.ID.ValueString(), strings.TrimSpace(plan.Name.ValueString()))
+			},
+			func(instance VMInstance) bool {
+				return strings.TrimSpace(instance.Name) == strings.TrimSpace(plan.Name.ValueString())
+			},
+		)
+		if err != nil {
 			resp.Diagnostics.AddError("Unable to rename Blue Lobster instance", err.Error())
 			return
 		}
-	}
-
-	remote, err := r.client.GetInstance(ctx, state.ID.ValueString())
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			resp.State.RemoveResource(ctx)
+		syncStandardInstanceModel(&state, remote)
+		state.SSHPublicKeyWO = types.StringNull()
+		state.PasswordWO = types.StringNull()
+	} else {
+		remote, err := r.client.GetInstance(ctx, state.ID.ValueString())
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				resp.State.RemoveResource(ctx)
+				return
+			}
+			resp.Diagnostics.AddError("Unable to read Blue Lobster instance before update", err.Error())
 			return
 		}
-		resp.Diagnostics.AddError("Unable to read Blue Lobster instance before update", err.Error())
-		return
+		syncStandardInstanceModel(&state, remote)
 	}
 
-	remote, err = reconcileDesiredPowerState(ctx, r.client, remote, normalizeDesiredPowerState(plan.PowerState))
+	remote, err := reconcileDesiredPowerState(ctx, r.client, VMInstance{
+		ID:          state.ID.ValueString(),
+		Name:        state.Name.ValueString(),
+		PowerStatus: state.PowerStatus.ValueString(),
+	}, normalizeDesiredPowerState(plan.PowerState))
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to reconcile Blue Lobster instance power state", err.Error())
 		return
@@ -301,12 +345,9 @@ func (r *InstanceResource) Delete(ctx context.Context, req resource.DeleteReques
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if err := r.client.DeleteInstance(ctx, state.ID.ValueString()); err != nil {
+	if err := deleteInstanceAndWait(ctx, r.client, state.ID.ValueString()); err != nil {
 		resp.Diagnostics.AddError("Unable to delete Blue Lobster instance", err.Error())
 		return
-	}
-	if err := r.client.WaitForDeletion(ctx, state.ID.ValueString()); err != nil {
-		resp.Diagnostics.AddError("Unable to confirm Blue Lobster instance deletion", err.Error())
 	}
 }
 
@@ -360,27 +401,152 @@ func reconcileDesiredPowerState(ctx context.Context, client *Client, current VMI
 		if normalizePowerState(current.PowerStatus) == "running" {
 			return current, nil
 		}
-		if err := client.PowerOnInstance(ctx, current.ID); err != nil {
-			return VMInstance{}, err
-		}
-		return client.WaitForPowerState(ctx, current.ID, "running")
+		return applyInstanceAction(ctx, client, current.ID, "power-on",
+			func(ctx context.Context) (ActionResponse, error) {
+				return client.PowerOnInstance(ctx, current.ID)
+			},
+			func(instance VMInstance) bool {
+				return normalizePowerState(instance.PowerStatus) == "running"
+			},
+		)
 	case "stopped":
 		if normalizePowerState(current.PowerStatus) == "stopped" {
 			return current, nil
 		}
-		if err := client.ShutdownInstance(ctx, current.ID); err != nil {
-			return VMInstance{}, err
-		}
-		return client.WaitForPowerState(ctx, current.ID, "stopped")
+		return applyInstanceAction(ctx, client, current.ID, "shutdown",
+			func(ctx context.Context) (ActionResponse, error) {
+				return client.ShutdownInstance(ctx, current.ID)
+			},
+			func(instance VMInstance) bool {
+				return normalizePowerState(instance.PowerStatus) == "stopped"
+			},
+		)
 	default:
 		return VMInstance{}, fmt.Errorf("unsupported desired power state %q", desired)
+	}
+}
+
+func applyInstanceAction(
+	ctx context.Context,
+	client *Client,
+	instanceID, action string,
+	submit func(context.Context) (ActionResponse, error),
+	condition func(VMInstance) bool,
+) (VMInstance, error) {
+	ticker := time.NewTicker(taskPollInterval)
+	defer ticker.Stop()
+
+	for {
+		response, err := submit(ctx)
+		if err == nil {
+			if response.TaskID != "" {
+				tflog.Debug(ctx, "waiting for Blue Lobster instance action task", map[string]any{
+					"instance_id": instanceID,
+					"action":      action,
+					"task_id":     response.TaskID,
+				})
+				if _, err := client.WaitForTask(ctx, response.TaskID); err != nil {
+					return VMInstance{}, err
+				}
+			}
+			return waitForInstanceCondition(ctx, client, instanceID, action, condition)
+		}
+
+		if !isAPIInvalidState(err) {
+			return VMInstance{}, err
+		}
+
+		tflog.Debug(ctx, "Blue Lobster instance action not ready; retrying", map[string]any{
+			"instance_id": instanceID,
+			"action":      action,
+			"error":       err.Error(),
+		})
+
+		current, readErr := client.GetInstance(ctx, instanceID)
+		if readErr == nil && condition(current) {
+			return current, nil
+		}
+		if readErr != nil && !errors.Is(readErr, ErrNotFound) {
+			return VMInstance{}, readErr
+		}
+
+		select {
+		case <-ctx.Done():
+			return VMInstance{}, fmt.Errorf("wait to retry Blue Lobster instance %s action on %s: %w", action, instanceID, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForInstanceCondition(ctx context.Context, client *Client, instanceID, conditionName string, condition func(VMInstance) bool) (VMInstance, error) {
+	ticker := time.NewTicker(taskPollInterval)
+	defer ticker.Stop()
+
+	for {
+		instance, err := client.GetInstance(ctx, instanceID)
+		if err != nil {
+			return VMInstance{}, err
+		}
+		if condition(instance) {
+			return instance, nil
+		}
+
+		tflog.Trace(ctx, "waiting for Blue Lobster instance condition", map[string]any{
+			"instance_id": instanceID,
+			"condition":   conditionName,
+			"power":       instance.PowerStatus,
+			"name":        instance.Name,
+		})
+
+		select {
+		case <-ctx.Done():
+			return VMInstance{}, fmt.Errorf("wait for Blue Lobster instance %s condition %s: %w", instanceID, conditionName, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func deleteInstanceAndWait(ctx context.Context, client *Client, instanceID string) error {
+	ticker := time.NewTicker(taskPollInterval)
+	defer ticker.Stop()
+
+	for {
+		response, err := client.DeleteInstance(ctx, instanceID)
+		if err == nil {
+			if response.TaskID != "" {
+				tflog.Debug(ctx, "waiting for Blue Lobster delete task", map[string]any{
+					"instance_id": instanceID,
+					"task_id":     response.TaskID,
+				})
+				if _, err := client.WaitForTask(ctx, response.TaskID); err != nil {
+					return err
+				}
+			}
+			return client.WaitForDeletion(ctx, instanceID)
+		}
+		if !isAPIInvalidState(err) {
+			return err
+		}
+
+		tflog.Debug(ctx, "Blue Lobster instance delete not ready; retrying", map[string]any{
+			"instance_id": instanceID,
+			"error":       err.Error(),
+		})
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait to retry Blue Lobster instance deletion on %s: %w", instanceID, ctx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 
 func syncStandardInstanceModel(model *instanceResourceModel, remote VMInstance) {
 	model.ID = types.StringValue(remote.ID)
 	model.Name = nullableString(remote.Name)
-	model.Region = nullableString(remote.Region)
+	if model.Region.IsNull() || model.Region.IsUnknown() || strings.TrimSpace(model.Region.ValueString()) == "" {
+		model.Region = nullableString(remote.Region)
+	}
 	model.InstanceType = nullableString(remote.InstanceType)
 	model.HostID = nullableString(remote.HostID)
 	model.IPAddress = nullableString(remote.IPAddress)

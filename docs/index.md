@@ -5,7 +5,6 @@ The Blue Lobster provider manages instances and closely related control-plane ob
 ## Resources
 
 - `bluelobster_instance`
-- `bluelobster_custom_instance`
 - `bluelobster_instance_firewall`
 - `bluelobster_backup_schedule`
 - `bluelobster_instance_ip`

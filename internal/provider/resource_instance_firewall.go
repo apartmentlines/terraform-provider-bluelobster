@@ -149,7 +149,8 @@ func (r *InstanceFirewallResource) applyFirewallPlan(ctx context.Context, plan *
 		}
 	}
 
-	for _, rule := range rules {
+	for i := len(rules) - 1; i >= 0; i-- {
+		rule := rules[i]
 		if rule.Enable == 0 {
 			rule.Enable = 1
 		}

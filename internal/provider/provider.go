@@ -98,7 +98,6 @@ func (p *BlueLobsterProvider) Configure(ctx context.Context, req provider.Config
 func (p *BlueLobsterProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewInstanceResource,
-		NewCustomInstanceResource,
 		NewInstanceFirewallResource,
 		NewBackupScheduleResource,
 		NewInstanceIPResource,

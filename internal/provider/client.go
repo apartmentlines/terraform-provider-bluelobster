@@ -62,6 +62,24 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("Blue Lobster API returned HTTP %d: %s", e.StatusCode, e.Body)
 }
 
+func (e *apiError) code() string {
+	var detail struct {
+		Detail struct {
+			Error string `json:"error"`
+		} `json:"detail"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(e.Body), &detail); err != nil {
+		return ""
+	}
+	return firstNonEmptyString(detail.Detail.Error, detail.Error)
+}
+
+func isAPIInvalidState(err error) bool {
+	var apiErr *apiError
+	return errors.As(err, &apiErr) && apiErr.code() == "invalid_state"
+}
+
 type Task struct {
 	ID        string         `json:"task_id"`
 	Status    string         `json:"status"`
@@ -111,27 +129,20 @@ type LaunchStandardInstanceInput struct {
 	ISOURL       string
 }
 
-type LaunchCustomInstanceInput struct {
-	Name         string
-	InstanceType string
-	Host         string
-	Cores        int64
-	MemoryGB     int64
-	DiskSizeGB   int64
-	GPUCount     int64
-	GPUModel     string
-	Username     string
-	SSHPublicKey string
-	Password     string
-	Metadata     map[string]string
-	TemplateName string
-	ISOURL       string
-}
-
 type LaunchResponse struct {
 	TaskID     string
 	InstanceID string
 	AssignedIP string
+}
+
+type ActionResponse struct {
+	Status     string `json:"status"`
+	Message    string `json:"message"`
+	TaskID     string `json:"task_id"`
+	InstanceID string `json:"instance_id"`
+	Host       string `json:"host"`
+	DurationMS int64  `json:"duration_ms"`
+	NewName    string `json:"new_name"`
 }
 
 type AvailableInstanceType struct {
@@ -154,6 +165,51 @@ type AvailableInstanceSpecs struct {
 	StorageGiB int64  `json:"storage_gib" tfsdk:"storage_gib"`
 	GPUs       int64  `json:"gpus" tfsdk:"gpus"`
 	GPUModel   string `json:"gpu_model" tfsdk:"gpu_model"`
+}
+
+func (s *AvailableInstanceSpecs) UnmarshalJSON(data []byte) error {
+	type rawSpecs struct {
+		VCPUs      int64           `json:"vcpus"`
+		MemoryGiB  int64           `json:"memory_gib"`
+		StorageGiB int64           `json:"storage_gib"`
+		GPUs       int64           `json:"gpus"`
+		GPUModel   json.RawMessage `json:"gpu_model"`
+	}
+
+	var raw rawSpecs
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	s.VCPUs = raw.VCPUs
+	s.MemoryGiB = raw.MemoryGiB
+	s.StorageGiB = raw.StorageGiB
+	s.GPUs = raw.GPUs
+
+	if len(raw.GPUModel) == 0 || string(raw.GPUModel) == "null" {
+		s.GPUModel = ""
+		return nil
+	}
+
+	var single string
+	if err := json.Unmarshal(raw.GPUModel, &single); err == nil {
+		s.GPUModel = strings.TrimSpace(single)
+		return nil
+	}
+
+	var list []string
+	if err := json.Unmarshal(raw.GPUModel, &list); err == nil {
+		items := make([]string, 0, len(list))
+		for _, item := range list {
+			if trimmed := strings.TrimSpace(item); trimmed != "" {
+				items = append(items, trimmed)
+			}
+		}
+		s.GPUModel = strings.Join(items, ", ")
+		return nil
+	}
+
+	return fmt.Errorf("decode available instance specs response: unsupported gpu_model shape")
 }
 
 type AvailableInstanceRegion struct {
@@ -258,10 +314,16 @@ func decodeTemplates(body []byte) ([]Template, error) {
 	}
 
 	var wrapped struct {
-		Data []Template `json:"data"`
+		Data      []Template `json:"data"`
+		Templates []Template `json:"templates"`
 	}
-	if err := json.Unmarshal(body, &wrapped); err == nil && len(wrapped.Data) > 0 {
-		return wrapped.Data, nil
+	if err := json.Unmarshal(body, &wrapped); err == nil {
+		switch {
+		case len(wrapped.Data) > 0:
+			return wrapped.Data, nil
+		case len(wrapped.Templates) > 0:
+			return wrapped.Templates, nil
+		}
 	}
 
 	var names []string
@@ -286,7 +348,7 @@ func (c *Client) ListInstances(ctx context.Context) ([]VMInstance, error) {
 
 func decodeInstances(body []byte) ([]VMInstance, error) {
 	var list []VMInstance
-	if err := json.Unmarshal(body, &list); err == nil && len(list) > 0 {
+	if err := json.Unmarshal(body, &list); err == nil {
 		return list, nil
 	}
 
@@ -355,41 +417,6 @@ func (c *Client) LaunchStandardInstance(ctx context.Context, input LaunchStandar
 	return decodeLaunchResponse(body)
 }
 
-func (c *Client) LaunchCustomInstance(ctx context.Context, input LaunchCustomInstanceInput) (LaunchResponse, error) {
-	payload := map[string]any{
-		"name":          input.Name,
-		"instance_type": input.InstanceType,
-		"host":          input.Host,
-		"cores":         input.Cores,
-		"memory":        input.MemoryGB,
-		"disk_size":     input.DiskSizeGB,
-		"gpu_count":     input.GPUCount,
-		"gpu_model":     input.GPUModel,
-		"username":      input.Username,
-	}
-	if input.SSHPublicKey != "" {
-		payload["ssh_key"] = input.SSHPublicKey
-	}
-	if input.Password != "" {
-		payload["password"] = input.Password
-	}
-	if len(input.Metadata) > 0 {
-		payload["metadata"] = input.Metadata
-	}
-	if input.TemplateName != "" {
-		payload["template_name"] = input.TemplateName
-	}
-	if input.ISOURL != "" {
-		payload["iso_url"] = input.ISOURL
-	}
-
-	body, err := c.doJSON(ctx, http.MethodPost, "/instances/launch-custom", payload)
-	if err != nil {
-		return LaunchResponse{}, err
-	}
-	return decodeLaunchResponse(body)
-}
-
 func decodeLaunchResponse(body []byte) (LaunchResponse, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -397,19 +424,28 @@ func decodeLaunchResponse(body []byte) (LaunchResponse, error) {
 	}
 
 	data, _ := raw["data"].(map[string]any)
+	task, _ := raw["task"].(map[string]any)
+	dataTask, _ := data["task"].(map[string]any)
+
 	instanceID := firstNonEmptyString(
+		firstStringFromList(raw["instance_ids"]),
+		firstStringFromList(raw["vm_uuids"]),
 		stringValue(raw["vm_uuid"]),
 		stringValue(raw["instance_id"]),
+		firstStringFromList(data["instance_ids"]),
+		firstStringFromList(data["vm_uuids"]),
 		stringValue(data["vm_uuid"]),
 		stringValue(data["instance_id"]),
 	)
-	if instanceID == "" {
-		if ids, ok := data["instance_ids"].([]any); ok && len(ids) > 0 {
-			instanceID = stringValue(ids[0])
-		}
-	}
 
-	taskID := firstNonEmptyString(stringValue(raw["task_id"]), stringValue(data["task_id"]))
+	taskID := firstNonEmptyString(
+		stringValue(raw["task_id"]),
+		stringValue(task["task_id"]),
+		stringValue(task["id"]),
+		stringValue(data["task_id"]),
+		stringValue(dataTask["task_id"]),
+		stringValue(dataTask["id"]),
+	)
 	if taskID == "" && instanceID == "" {
 		return LaunchResponse{}, fmt.Errorf("decode launch response: missing task_id and instance identifier")
 	}
@@ -417,31 +453,60 @@ func decodeLaunchResponse(body []byte) (LaunchResponse, error) {
 	return LaunchResponse{
 		TaskID:     taskID,
 		InstanceID: instanceID,
-		AssignedIP: firstNonEmptyString(stringValue(raw["assigned_ip"]), stringValue(data["assigned_ip"])),
+		AssignedIP: firstNonEmptyString(
+			stringValue(raw["assigned_ip"]),
+			stringValue(raw["ip_address"]),
+			stringValue(data["assigned_ip"]),
+			stringValue(data["ip_address"]),
+		),
 	}, nil
 }
 
-func (c *Client) RenameInstance(ctx context.Context, id, name string) error {
-	_, err := c.doJSON(ctx, http.MethodPut, "/instances/"+id+"/rename", map[string]any{"name": name})
-	return err
-}
-
-func (c *Client) PowerOnInstance(ctx context.Context, id string) error {
-	_, err := c.doJSON(ctx, http.MethodPost, "/instances/"+id+"/power-on", nil)
-	return err
-}
-
-func (c *Client) ShutdownInstance(ctx context.Context, id string) error {
-	_, err := c.doJSON(ctx, http.MethodPost, "/instances/"+id+"/shutdown", nil)
-	return err
-}
-
-func (c *Client) DeleteInstance(ctx context.Context, id string) error {
-	_, err := c.doJSON(ctx, http.MethodDelete, "/instances/"+id, nil)
-	if errors.Is(err, ErrNotFound) {
-		return nil
+func (c *Client) RenameInstance(ctx context.Context, id, name string) (ActionResponse, error) {
+	body, err := c.doJSON(ctx, http.MethodPut, "/instances/"+id+"/rename", map[string]any{"name": name})
+	if err != nil {
+		return ActionResponse{}, err
 	}
-	return err
+	return decodeActionResponse(body)
+}
+
+func (c *Client) PowerOnInstance(ctx context.Context, id string) (ActionResponse, error) {
+	body, err := c.doJSON(ctx, http.MethodPost, "/instances/"+id+"/power-on", nil)
+	if err != nil {
+		return ActionResponse{}, err
+	}
+	return decodeActionResponse(body)
+}
+
+func (c *Client) ShutdownInstance(ctx context.Context, id string) (ActionResponse, error) {
+	body, err := c.doJSON(ctx, http.MethodPost, "/instances/"+id+"/shutdown", nil)
+	if err != nil {
+		return ActionResponse{}, err
+	}
+	return decodeActionResponse(body)
+}
+
+func (c *Client) DeleteInstance(ctx context.Context, id string) (ActionResponse, error) {
+	body, err := c.doJSON(ctx, http.MethodDelete, "/instances/"+id, nil)
+	if errors.Is(err, ErrNotFound) {
+		return ActionResponse{}, nil
+	}
+	if err != nil {
+		return ActionResponse{}, err
+	}
+	return decodeActionResponse(body)
+}
+
+func decodeActionResponse(body []byte) (ActionResponse, error) {
+	if len(body) == 0 {
+		return ActionResponse{}, nil
+	}
+
+	var response ActionResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return ActionResponse{}, fmt.Errorf("decode action response: %w", err)
+	}
+	return response, nil
 }
 
 func (c *Client) GetTask(ctx context.Context, id string) (Task, error) {
@@ -472,7 +537,7 @@ func (c *Client) WaitForTask(ctx context.Context, id string) (Task, error) {
 		switch strings.ToUpper(strings.TrimSpace(task.Status)) {
 		case "COMPLETED":
 			return task, nil
-		case "FAILED":
+		case "FAILED", "CANCELLED":
 			if task.Message == "" {
 				task.Message = "task failed"
 			}
@@ -624,15 +689,20 @@ func decodeBackupSchedule(body []byte) (BackupSchedule, error) {
 		return schedule, nil
 	}
 	var wrapped struct {
-		Data BackupSchedule `json:"data"`
+		Data     BackupSchedule `json:"data"`
+		Schedule BackupSchedule `json:"schedule"`
 	}
 	if err := json.Unmarshal(body, &wrapped); err != nil {
 		return BackupSchedule{}, fmt.Errorf("decode backup schedule response: %w", err)
 	}
-	if wrapped.Data.Frequency == "" {
+	switch {
+	case wrapped.Data.Frequency != "":
+		return wrapped.Data, nil
+	case wrapped.Schedule.Frequency != "":
+		return wrapped.Schedule, nil
+	default:
 		return BackupSchedule{}, fmt.Errorf("decode backup schedule response: missing frequency")
 	}
-	return wrapped.Data, nil
 }
 
 func (c *Client) UpsertBackupSchedule(ctx context.Context, instanceID string, schedule BackupSchedule) error {
@@ -673,25 +743,49 @@ func decodeIPList(body []byte) ([]string, error) {
 	}
 
 	var wrapped struct {
-		IPs []string `json:"ips"`
+		IPs   []any `json:"ips"`
+		Data  []any `json:"data"`
+		Items []any `json:"items"`
 	}
-	if err := json.Unmarshal(body, &wrapped); err == nil && wrapped.IPs != nil {
-		return wrapped.IPs, nil
+	if err := json.Unmarshal(body, &wrapped); err == nil {
+		switch {
+		case wrapped.IPs != nil:
+			return decodeIPEntries(wrapped.IPs)
+		case wrapped.Data != nil:
+			return decodeIPEntries(wrapped.Data)
+		case wrapped.Items != nil:
+			return decodeIPEntries(wrapped.Items)
+		}
 	}
 
 	var generic []map[string]any
 	if err := json.Unmarshal(body, &generic); err == nil {
-		out := make([]string, 0, len(generic))
+		entries := make([]any, 0, len(generic))
 		for _, item := range generic {
-			ip := firstNonEmptyString(stringValue(item["ip_address"]), stringValue(item["address"]))
+			entries = append(entries, item)
+		}
+		return decodeIPEntries(entries)
+	}
+
+	return nil, fmt.Errorf("decode IP list response: unsupported response shape")
+}
+
+func decodeIPEntries(entries []any) ([]string, error) {
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		switch value := entry.(type) {
+		case string:
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		case map[string]any:
+			ip := firstNonEmptyString(stringValue(value["ip_address"]), stringValue(value["address"]))
 			if ip != "" {
 				out = append(out, ip)
 			}
 		}
-		return out, nil
 	}
-
-	return nil, fmt.Errorf("decode IP list response: unsupported response shape")
+	return out, nil
 }
 
 func (c *Client) AssignInstanceIP(ctx context.Context, instanceID string) error {
@@ -700,7 +794,7 @@ func (c *Client) AssignInstanceIP(ctx context.Context, instanceID string) error 
 }
 
 func (c *Client) ReleaseInstanceIP(ctx context.Context, instanceID, ip string) error {
-	_, err := c.doJSON(ctx, http.MethodDelete, "/instances/"+instanceID+"/ips/"+ip, nil)
+	_, err := c.doJSON(ctx, http.MethodDelete, "/instances/"+instanceID+"/ips/"+url.PathEscape(ip), nil)
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
@@ -823,6 +917,19 @@ func firstNonEmptyString(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
 			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func firstStringFromList(v any) string {
+	items, ok := v.([]any)
+	if !ok {
+		return ""
+	}
+	for _, item := range items {
+		if value := stringValue(item); value != "" {
+			return value
 		}
 	}
 	return ""
